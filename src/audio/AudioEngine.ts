@@ -56,7 +56,7 @@ export class AudioEngine {
   async start(): Promise<void> {
     if (this.ctx) {
       if (this.node) await this.ctx.resume();
-      else await this.starting; // a start is still building the graph (or failed: retry below)
+      else await this.starting; // a start is still building the graph; if it fails, this throws too
       if (this.node) return;
     }
     // Safari on iOS only lets a user gesture start audio, and the gesture is gone after the
@@ -70,11 +70,15 @@ export class AudioEngine {
       void this.ctx?.close().catch(() => {});
       this.ctx = null;
       this.node = null;
+      this.master = this.micIn = this.analyser = this.analyserFast = this.analyserScope = null;
+      this.removeWake?.();
+      this.removeWake = null;
       throw e;
     }
   }
 
   private starting: Promise<void> | null = null;
+  private removeWake: (() => void) | null = null;
 
   private async build(): Promise<void> {
     // iOS mutes Web Audio while the ringer switch is silent, unlike media playback (Safari 16.4+)
@@ -103,10 +107,16 @@ export class AudioEngine {
     const wake = () => {
       if (ctx.state !== "running") void ctx.resume().catch(() => {});
     };
-    for (const ev of ["touchend", "pointerdown", "keydown"]) addEventListener(ev, wake, { passive: true });
-    document.addEventListener("visibilitychange", () => {
+    const onVisible = () => {
       if (document.visibilityState === "visible") wake();
-    });
+    };
+    const evs = ["touchend", "pointerdown", "keydown"];
+    for (const ev of evs) addEventListener(ev, wake, { passive: true });
+    document.addEventListener("visibilitychange", onVisible);
+    this.removeWake = () => {
+      for (const ev of evs) removeEventListener(ev, wake);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
     await ctx.audioWorklet.addModule(workletUrl);
     await unlocked;
     // the worklet instantiates the engine from the module compiled at startup (main.tsx)
