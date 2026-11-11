@@ -55,8 +55,40 @@ export class AudioEngine {
 
   async start(): Promise<void> {
     if (this.ctx) {
-      await this.ctx.resume();
-      return;
+      if (this.node) await this.ctx.resume();
+      else await this.starting; // a start is still building the graph; if it fails, this throws too
+      if (this.node) return;
+    }
+    // Safari on iOS only lets a user gesture start audio, and the gesture is gone after the
+    // first await: the context must be created and resumed (with a sound played) in the tap
+    // itself, before the worklet module loads. Resuming only at the end left iOS silent.
+    this.starting = this.build();
+    try {
+      await this.starting;
+    } catch (e) {
+      // a failed start must not leave a context with no voice that a retry would "resume"
+      void this.ctx?.close().catch(() => {});
+      this.ctx = null;
+      this.node = null;
+      this.master = this.micIn = this.analyser = this.analyserFast = this.analyserScope = null;
+      this.removeWake?.();
+      this.removeWake = null;
+      throw e;
+    }
+  }
+
+  private starting: Promise<void> | null = null;
+  private removeWake: (() => void) | null = null;
+
+  private async build(): Promise<void> {
+    // iOS mutes Web Audio while the ringer switch is silent, unlike media playback (Safari 16.4+)
+    const session = (navigator as Navigator & { audioSession?: { type: string } }).audioSession;
+    if (session) {
+      try {
+        session.type = "playback";
+      } catch {
+        // not settable: the ringer switch will mute us
+      }
     }
     // 48 kHz whatever the device runs at (the browser resamples): the airway's cost grows with
     // the square of its rate, and a 192 kHz device took ~3x the CPU of 48 kHz and starved the
@@ -64,7 +96,29 @@ export class AudioEngine {
     const ctx = new AudioContext({ latencyHint: "interactive", sampleRate: 48000 });
     this.ctx = ctx;
     this.sampleRate = ctx.sampleRate;
+    const unlocked = ctx.resume().catch(() => {});
+    // an empty buffer played inside the gesture unlocks older iOS versions
+    const unlock = ctx.createBufferSource();
+    unlock.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+    unlock.connect(ctx.destination);
+    unlock.start(0);
+    // iOS suspends the context ("interrupted") for a call, Siri or backgrounding: wake it with
+    // the next touch
+    const wake = () => {
+      if (ctx.state !== "running") void ctx.resume().catch(() => {});
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") wake();
+    };
+    const evs = ["touchend", "pointerdown", "keydown"];
+    for (const ev of evs) addEventListener(ev, wake, { passive: true });
+    document.addEventListener("visibilitychange", onVisible);
+    this.removeWake = () => {
+      for (const ev of evs) removeEventListener(ev, wake);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
     await ctx.audioWorklet.addModule(workletUrl);
+    await unlocked;
     // the worklet instantiates the engine from the module compiled at startup (main.tsx)
     const node = new AudioWorkletNode(ctx, "chimera", { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2], processorOptions: { module: chimeraModule() } });
     this.node = node;
